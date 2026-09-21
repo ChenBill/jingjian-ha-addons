@@ -1,5 +1,5 @@
 name: JingJian Smart Switch Sequence Gateway
-version: "1.1.0"
+version: "1.1.1"
 slug: jingjian_sequence_gateway
 description: Receives JingJian MQTT sequence commands and controls Zigbee2MQTT devices in order.
 arch:

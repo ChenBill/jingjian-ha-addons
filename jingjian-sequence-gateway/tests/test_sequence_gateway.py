@@ -266,6 +266,52 @@ class SequenceGatewayTest(unittest.TestCase):
         self.assertEqual(second["reason"], "already_running")
         self.assertEqual(first_result[0]["status"], "completed")
 
+    def test_gateway_logs_immediate_sequence_lifecycle_and_device_commands(self) -> None:
+        published = []
+        gateway = SequenceGateway(publish=published.append, sleep_fn=lambda _milliseconds: None)
+        gateway.set_devices(self.devices)
+        gateway.set_groups(self.groups)
+
+        with self.assertLogs("jingjian.sequence_gateway", level="INFO") as captured:
+            result = gateway.handle_command({
+                "requestId": "req-logs",
+                "action": "turn_on",
+                "groupIds": ["1"],
+            })
+
+        logs = "\n".join(captured.output)
+        self.assertEqual(result["status"], "completed")
+        self.assertIn("sequence_received request_id=req-logs", logs)
+        self.assertIn("sequence_started request_id=req-logs", logs)
+        self.assertIn("device_command request_id=req-logs", logs)
+        self.assertIn("sequence_completed request_id=req-logs", logs)
+
+    def test_gateway_logs_schedule_receive_trigger_and_completion(self) -> None:
+        gateway = SequenceGateway(publish=lambda _event: None, sleep_fn=lambda _milliseconds: None)
+        gateway.set_devices(self.devices)
+        gateway.set_groups(self.groups)
+        schedule = {
+            "schemaVersion": 1,
+            "id": "plan-log",
+            "revision": 1,
+            "timeZone": "Asia/Shanghai",
+            "events": [{
+                "id": "event-on",
+                "time": "09:00",
+                "weekdays": ["mon"],
+                "commands": [{"ieee": "0a:bb:cc:dd:ee:ff:00:01", "payload": {"state": "ON"}}],
+            }],
+        }
+
+        with self.assertLogs("jingjian.sequence_gateway", level="INFO") as captured:
+            gateway.handle_schedule(schedule)
+            gateway.run_schedule_tick(datetime(2026, 9, 21, 9, 0, tzinfo=timezone(timedelta(hours=8))))
+
+        logs = "\n".join(captured.output)
+        self.assertIn("schedule_received schedule_id=plan-log revision=1", logs)
+        self.assertIn("schedule_triggered schedule_id=plan-log revision=1 event_id=event-on", logs)
+        self.assertIn("sequence_completed request_id=plan-log:1:event-on:2026-09-21-09-00", logs)
+
     def test_schedule_validation_normalizes_retained_plan_events(self) -> None:
         result = validate_schedule({
             "schemaVersion": 1,

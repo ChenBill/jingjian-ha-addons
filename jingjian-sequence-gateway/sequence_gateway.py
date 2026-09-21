@@ -27,6 +27,7 @@ except ImportError:  # pragma: no cover - 本地单元测试不需要 MQTT 依�
 
 
 LOGGER = logging.getLogger("jingjian.sequence_gateway")
+LOGGER.addHandler(logging.NullHandler())
 DEFAULT_COMMAND_TOPIC = "jingjian/smart-switch/sequences/commands"
 DEFAULT_STATUS_TOPIC = "jingjian/smart-switch/sequences/status"
 DEFAULT_SCHEDULE_TOPIC = "jingjian/smart-switch/schedules"
@@ -344,6 +345,7 @@ class SequenceGateway:
         _as_records(snapshot, "devices")
         self._devices = snapshot
         self._devices_ready = True
+        LOGGER.info("devices_snapshot_ready device_count=%d", len(_as_records(snapshot, "devices")))
 
     def set_groups(self, snapshot: Any) -> None:
         """更新分组快照并标记分组侧初始化完成。"""
@@ -351,6 +353,7 @@ class SequenceGateway:
         _as_records(snapshot, "groups")
         self._groups = snapshot
         self._groups_ready = True
+        LOGGER.info("groups_snapshot_ready group_count=%d", len(_as_records(snapshot, "groups")))
 
     def publish_lifecycle(self, status: str, message: str | None = None) -> dict[str, Any]:
         """发布网关启动或空闲状态。"""
@@ -371,6 +374,14 @@ class SequenceGateway:
 
         request_id = payload.get("requestId") if isinstance(payload, Mapping) else None
         request_id = request_id if isinstance(request_id, str) and request_id.strip() else _new_id("invalid")
+        LOGGER.info(
+            "sequence_received request_id=%s action=%s group_count=%d device_count=%d retained=%s",
+            request_id,
+            payload.get("action") if isinstance(payload, Mapping) else None,
+            len(payload.get("groupIds", [])) if isinstance(payload, Mapping) and isinstance(payload.get("groupIds", []), list) else 0,
+            len(payload.get("standaloneDeviceIds", [])) if isinstance(payload, Mapping) and isinstance(payload.get("standaloneDeviceIds", []), list) else 0,
+            retained,
+        )
         try:
             command = validate_command(payload)
         except CommandError as error:
@@ -412,6 +423,13 @@ class SequenceGateway:
         schedule = validate_schedule(payload)
         schedule_id = schedule["id"]
         current = self._schedules.get(schedule_id)
+        LOGGER.info(
+            "schedule_received schedule_id=%s revision=%s deleted=%s event_count=%d",
+            schedule_id,
+            schedule["revision"],
+            schedule["deleted"],
+            len(schedule.get("events", [])),
+        )
         if schedule["deleted"] and current is not None and "revision" not in payload:
             schedule["revision"] = current["revision"] + 1
         if current is not None and schedule["revision"] <= current["revision"]:
@@ -425,6 +443,7 @@ class SequenceGateway:
                 "updatedAt": _now_iso(),
             }
             self._publish_status(result, self.schedule_status_topic)
+            LOGGER.warning("schedule_ignored schedule_id=%s revision=%s reason=older_revision", schedule_id, current["revision"])
             return result
         if schedule["deleted"]:
             if current is None:
@@ -433,6 +452,7 @@ class SequenceGateway:
                 self._schedules.pop(schedule_id, None)
                 result = {"schemaVersion": 1, "gatewayId": self.gateway_id, "scheduleId": schedule_id, "revision": schedule["revision"], "status": "deleted", "updatedAt": _now_iso()}
             self._publish_status(result, self.schedule_status_topic)
+            LOGGER.info("schedule_deleted schedule_id=%s revision=%s status=%s", schedule_id, result.get("revision", 0), result["status"])
             return result
         self._schedules[schedule_id] = schedule
         result = {
@@ -445,6 +465,7 @@ class SequenceGateway:
             "updatedAt": _now_iso(),
         }
         self._publish_status(result, self.schedule_status_topic)
+        LOGGER.info("schedule_updated schedule_id=%s revision=%s event_count=%d", schedule_id, schedule["revision"], len(schedule["events"]))
         return result
 
     def run_schedule_tick(self, now: datetime | None = None) -> int:
@@ -464,6 +485,13 @@ class SequenceGateway:
                     continue
                 self._schedule_fired_keys.add(execution_key)
                 triggered += 1
+                LOGGER.info(
+                    "schedule_triggered schedule_id=%s revision=%s event_id=%s execution_key=%s",
+                    schedule["id"],
+                    schedule["revision"],
+                    event["id"],
+                    execution_key,
+                )
                 self._execute_schedule_event(schedule, event, execution_key)
         return triggered
 
@@ -478,6 +506,7 @@ class SequenceGateway:
             "executionKey": execution_key,
         }
         if len(states) != 1:
+            LOGGER.error("schedule_failed schedule_id=%s revision=%s event_id=%s reason=mixed_actions", schedule["id"], schedule["revision"], event["id"])
             self._publish_status({"schemaVersion": 1, "gatewayId": self.gateway_id, **extra, "status": "failed", "reason": "mixed_actions", "updatedAt": _now_iso()}, self.schedule_status_topic)
             return
         try:
@@ -493,6 +522,10 @@ class SequenceGateway:
                 blocking=True,
             )
         except CommandError as error:
+            LOGGER.error(
+                "schedule_failed schedule_id=%s revision=%s event_id=%s reason=%s message=%s",
+                schedule["id"], schedule["revision"], event["id"], error.reason, error.message,
+            )
             self._publish_status({"schemaVersion": 1, "gatewayId": self.gateway_id, **extra, "status": "failed", "reason": error.reason, "message": error.message, "updatedAt": _now_iso()}, self.schedule_status_topic)
 
     def _resolve_schedule_targets(self, commands: Iterable[Mapping[str, Any]]) -> list[DeviceTarget]:
@@ -535,20 +568,24 @@ class SequenceGateway:
         if not self._execution_lock.acquire(blocking=blocking):
             return self._reject(request_id, "already_running", "当前已有时序任务执行中", status_topic=status_topic, extra=extra)
         try:
+            source = "schedule" if extra.get("scheduleId") else "sequence"
             base = {"schemaVersion": 1, "gatewayId": self.gateway_id, "requestId": request_id, "executionId": _new_id("exec"), "action": action, "targetCount": len(targets), **extra}
+            LOGGER.info("sequence_started request_id=%s source=%s action=%s target_count=%d", request_id, source, action, len(targets))
             self._publish_status({**base, "status": "accepted", "updatedAt": _now_iso()}, status_topic)
             self._publish_status({**base, "status": "running", "updatedAt": _now_iso()}, status_topic)
             state = "ON" if action == "turn_on" else "OFF"
             for index, target in enumerate(targets):
+                LOGGER.info("device_command request_id=%s source=%s index=%d total=%d device_id=%s friendly_name=%s state=%s", request_id, source, index + 1, len(targets), target.device_id, target.friendly_name, state)
                 self._publish_device_command(target, state)
                 if index < len(targets) - 1:
                     self.sleep_fn(wait_after_ms)
             result = {**base, "status": "completed", "updatedAt": _now_iso()}
             self._results[request_id] = copy.deepcopy(result)
             self._publish_status(result, status_topic)
+            LOGGER.info("sequence_completed request_id=%s source=%s action=%s target_count=%d", request_id, source, action, len(targets))
             return result
         except Exception as error:  # pragma: no cover - 具体 MQTT 故障由运行环境触发
-            LOGGER.exception("时序执行失败")
+            LOGGER.exception("sequence_failed request_id=%s source=%s reason=execution_failed", request_id, "schedule" if extra.get("scheduleId") else "sequence")
             result = {**base, "status": "failed", "reason": "execution_failed", "message": str(error), "updatedAt": _now_iso()}
             self._results[request_id] = copy.deepcopy(result)
             self._publish_status(result, status_topic)
@@ -606,6 +643,7 @@ class SequenceGateway:
             **(extra or {}),
         }
         self._publish_status(result, status_topic)
+        LOGGER.warning("sequence_rejected request_id=%s reason=%s message=%s", request_id, reason, message)
         return result
 
 
@@ -654,6 +692,7 @@ class MqttSequenceApplication:
         password = str(self.options.get("mqtt_password", "cashier"))
         self.client.username_pw_set(username, password)
         self.gateway.publish_lifecycle("starting", "正在等待 Zigbee2MQTT 设备和分组快照")
+        LOGGER.info("mqtt_start host=%s port=%s command_topic=%s schedule_topic=%s", host, port, self.command_topic, self.schedule_topic)
         self.client.connect(host, port, keepalive=60)
         self._start_schedule_thread()
         self.client.loop_forever()
@@ -665,6 +704,8 @@ class MqttSequenceApplication:
         self._connected = True
         for topic in (self.command_topic, self.devices_topic, self.groups_topic, f"{self.schedule_topic}/+"):
             client.subscribe(topic, qos=1)
+            LOGGER.info("mqtt_subscribed topic=%s qos=1", topic)
+        LOGGER.info("mqtt_connected schedule_status_topic=%s", self.schedule_status_topic)
         self.gateway.publish_lifecycle("connected", "MQTT 已连接，等待或刷新 retained 快照")
 
     def _on_disconnect(self, _client: Any, _userdata: Any, _disconnect_flags: Any, reason_code: Any, *args: Any) -> None:
@@ -675,6 +716,7 @@ class MqttSequenceApplication:
     def _on_message(self, _client: Any, _userdata: Any, message: Any) -> None:
         try:
             payload = json.loads(message.payload.decode("utf-8"))
+            LOGGER.info("mqtt_message_received topic=%s retained=%s payload_bytes=%d", message.topic, bool(message.retain), len(message.payload))
             if message.topic == self.devices_topic:
                 self.gateway.set_devices(payload)
                 self._publish_idle_when_ready()
@@ -691,7 +733,7 @@ class MqttSequenceApplication:
             if message.topic.startswith(f"{self.schedule_topic}/"):
                 self.gateway.handle_schedule(payload)
         except (UnicodeDecodeError, json.JSONDecodeError, CommandError) as error:
-            LOGGER.error("MQTT 消息处理失败: %s", error)
+            LOGGER.error("mqtt_message_failed topic=%s reason=%s", getattr(message, "topic", "unknown"), error, exc_info=True)
 
     def _start_schedule_thread(self) -> None:
         """启动单一后台调度线程，避免多个连接回调重复创建。"""

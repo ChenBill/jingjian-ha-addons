@@ -51,6 +51,28 @@ jingjian-ha-addons/
 
 应用启动后会重新订阅这两个主题和命令主题，因此 MQTT 断线重连不会丢失订阅。命令主题必须是非 retained 消息；启动或重连时收到旧 retained 命令会被明确拒绝，不会重复开关机。
 
+## 日志与故障排查
+
+应用使用 `INFO`、`WARNING` 和 `ERROR` 记录完整业务链路。日志不打印 MQTT 密码和消息正文，只打印 Topic、请求 ID、方案 ID、revision、事件 ID、目标数量和 payload 字节数。
+
+即时顺序开关机会记录：
+
+- `sequence_received`：收到命令，包含 `request_id`、动作、分组/设备数量和 retained 标志。
+- `sequence_started`：通过校验并开始执行，包含来源、动作和目标数量。
+- `device_command`：逐台发布 Zigbee2MQTT 命令，包含设备 ID、friendly name、序号和 `ON/OFF`。
+- `sequence_completed`：全部设备执行完成。
+- `sequence_rejected`：参数、快照、并发锁或 retained 命令被拒绝。
+- `sequence_failed`：设备命令发布或执行过程异常，附带 Python 堆栈。
+
+定时方案会记录：
+
+- `schedule_received`、`schedule_updated`、`schedule_ignored`、`schedule_deleted`：方案发布、版本替换、旧版本忽略和删除。
+- `schedule_triggered`：到达方案的时间和星期，包含 `execution_key`。
+- `schedule_failed`：方案目标、动作或执行异常。
+- 同一轮定时执行还会复用 `sequence_started`、`device_command` 和 `sequence_completed`。
+
+MQTT 生命周期会记录 `mqtt_start`、`mqtt_connected`、`mqtt_subscribed`、`mqtt_disconnected`、`mqtt_message_received` 和 `mqtt_message_failed`。可在 Home Assistant 的 App“日志”页搜索 `schedule_`、`sequence_` 或 `mqtt_` 快速定位问题。
+
 ## 定时方案协议
 
 收银台将定时方案作为 retained 消息发布到 `jingjian/smart-switch/schedules/<planId>`。网关订阅 `schedules/+`，收到方案后按 `revision` 保存最新版本；删除方案时发布 `{"schemaVersion":1,"id":"<planId>","deleted":true}`。Broker 的 retained 消息是网关重启后的方案来源。
