@@ -16,8 +16,9 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Iterable, Mapping
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 try:
     import paho.mqtt.client as mqtt
@@ -28,6 +29,9 @@ except ImportError:  # pragma: no cover - 本地单元测试不需要 MQTT 依�
 LOGGER = logging.getLogger("jingjian.sequence_gateway")
 DEFAULT_COMMAND_TOPIC = "jingjian/smart-switch/sequences/commands"
 DEFAULT_STATUS_TOPIC = "jingjian/smart-switch/sequences/status"
+DEFAULT_SCHEDULE_TOPIC = "jingjian/smart-switch/schedules"
+DEFAULT_SCHEDULE_STATUS_TOPIC = "jingjian/smart-switch/schedules/status"
+DEFAULT_TIME_ZONE = "Asia/Shanghai"
 DEFAULT_ZIGBEE_BASE_TOPIC = "zigbee2mqtt"
 DEFAULT_WAIT_AFTER_MS = 1500
 MAX_WAIT_AFTER_MS = 10 * 60 * 1000
@@ -50,6 +54,83 @@ class DeviceTarget:
 
     device_id: str
     friendly_name: str
+
+
+def validate_schedule(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """校验并规范收银台发布的 retained 定时方案。"""
+
+    if not isinstance(payload, Mapping):
+        raise CommandError("invalid_schedule", "定时方案必须是 JSON 对象")
+    schedule_id = payload.get("id")
+    if not isinstance(schedule_id, str) or not schedule_id.strip():
+        raise CommandError("invalid_schedule_id", "定时方案 id 不能为空")
+    if payload.get("schemaVersion", 1) != 1:
+        raise CommandError("unsupported_schema", "不支持的定时方案协议版本")
+    revision = payload.get("revision", 1)
+    if isinstance(revision, bool) or not isinstance(revision, int) or revision < 1:
+        raise CommandError("invalid_revision", "定时方案 revision 必须是正整数")
+    deleted = payload.get("deleted", False)
+    if not isinstance(deleted, bool):
+        raise CommandError("invalid_schedule", "deleted 必须是布尔值")
+    if deleted:
+        return {"schemaVersion": 1, "id": schedule_id.strip(), "revision": revision, "deleted": True}
+
+    time_zone = payload.get("timeZone", DEFAULT_TIME_ZONE)
+    if not isinstance(time_zone, str) or not time_zone.strip():
+        raise CommandError("invalid_timezone", "定时方案时区不能为空")
+    try:
+        _resolve_time_zone(time_zone.strip())
+    except ZoneInfoNotFoundError as error:
+        raise CommandError("invalid_timezone", f"不支持的定时方案时区：{time_zone}") from error
+
+    raw_events = payload.get("events", [])
+    if not isinstance(raw_events, list):
+        raise CommandError("invalid_events", "定时方案 events 必须是数组")
+    events: list[dict[str, Any]] = []
+    for raw_event in raw_events:
+        if not isinstance(raw_event, Mapping):
+            raise CommandError("invalid_event", "定时方案事件结构无效")
+        event_id = raw_event.get("id")
+        event_time = raw_event.get("time")
+        weekdays = raw_event.get("weekdays")
+        commands = raw_event.get("commands")
+        if not isinstance(event_id, str) or not event_id.strip():
+            raise CommandError("invalid_event", "定时方案事件 id 不能为空")
+        if not isinstance(event_time, str) or not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", event_time):
+            raise CommandError("invalid_event_time", f"事件 {event_id} 的时间必须是 HH:mm")
+        if not isinstance(weekdays, list) or not weekdays or any(day not in ("mon", "tue", "wed", "thu", "fri", "sat", "sun") for day in weekdays):
+            raise CommandError("invalid_weekdays", f"事件 {event_id} 的 weekdays 无效")
+        if not isinstance(commands, list) or not commands:
+            raise CommandError("invalid_commands", f"事件 {event_id} 没有可执行目标")
+        normalized_commands: list[dict[str, Any]] = []
+        for command in commands:
+            if not isinstance(command, Mapping):
+                raise CommandError("invalid_command", f"事件 {event_id} 的目标结构无效")
+            ieee = normalize_id(command.get("ieee") or command.get("deviceId"))
+            payload_value = command.get("payload")
+            state = payload_value.get("state") if isinstance(payload_value, Mapping) else None
+            if not ieee or state not in ("ON", "OFF"):
+                raise CommandError("invalid_command", f"事件 {event_id} 的目标缺少稳定设备 ID 或 state")
+            normalized_commands.append({
+                "ieee": ieee,
+                "deviceId": normalize_id(command.get("deviceId") or ieee),
+                "payload": {"state": state},
+            })
+        events.append({
+            "id": event_id.strip(),
+            "time": event_time,
+            "weekdays": list(dict.fromkeys(weekdays)),
+            "commands": normalized_commands,
+        })
+
+    return {
+        "schemaVersion": 1,
+        "id": schedule_id.strip(),
+        "revision": revision,
+        "timeZone": time_zone.strip(),
+        "deleted": False,
+        "events": events,
+    }
 
 
 def normalize_id(value: Any) -> str:
@@ -230,6 +311,7 @@ class SequenceGateway:
         *,
         command_topic: str = DEFAULT_COMMAND_TOPIC,
         status_topic: str = DEFAULT_STATUS_TOPIC,
+        schedule_status_topic: str = DEFAULT_SCHEDULE_STATUS_TOPIC,
         zigbee_base_topic: str = DEFAULT_ZIGBEE_BASE_TOPIC,
         gateway_id: str = "ha-sequence-gateway",
         sleep_fn: SleepFunction | None = None,
@@ -237,6 +319,7 @@ class SequenceGateway:
         self.publish = publish
         self.command_topic = command_topic.rstrip("/")
         self.status_topic = status_topic.rstrip("/")
+        self.schedule_status_topic = schedule_status_topic.rstrip("/")
         self.zigbee_base_topic = zigbee_base_topic.rstrip("/")
         self.gateway_id = gateway_id
         self.sleep_fn = sleep_fn or (lambda milliseconds: time.sleep(milliseconds / 1000))
@@ -246,7 +329,8 @@ class SequenceGateway:
         self._groups_ready = False
         self._execution_lock = threading.Lock()
         self._results: dict[str, dict[str, Any]] = {}
-        self._execution_number = 0
+        self._schedules: dict[str, dict[str, Any]] = {}
+        self._schedule_fired_keys: set[str] = set()
 
     @property
     def snapshots_ready(self) -> bool:
@@ -303,9 +387,6 @@ class SequenceGateway:
             return self._reject(request_id, "retained_command", "即时命令禁止使用 retained")
         if not self.snapshots_ready:
             return self._reject(request_id, "snapshots_not_ready", "设备和分组快照尚未准备完成")
-        if not self._execution_lock.acquire(blocking=False):
-            return self._reject(request_id, "already_running", "当前已有时序任务执行中")
-
         try:
             targets = resolve_targets(
                 self._devices,
@@ -313,39 +394,164 @@ class SequenceGateway:
                 command["groupIds"],
                 command["standaloneDeviceIds"],
             )
-            execution_id = _new_id("exec")
-            base = {
+            return self._execute_targets(
+                request_id,
+                command["action"],
+                targets,
+                command["waitAfterMs"],
+                status_topic=self.status_topic,
+                extra={},
+                blocking=False,
+            )
+        except CommandError as error:
+            return self._reject(request_id, error.reason, error.message)
+
+    def handle_schedule(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        """接收 retained 定时方案，按 revision 更新或删除内存方案。"""
+
+        schedule = validate_schedule(payload)
+        schedule_id = schedule["id"]
+        current = self._schedules.get(schedule_id)
+        if schedule["deleted"] and current is not None and "revision" not in payload:
+            schedule["revision"] = current["revision"] + 1
+        if current is not None and schedule["revision"] <= current["revision"]:
+            result = {
                 "schemaVersion": 1,
                 "gatewayId": self.gateway_id,
-                "requestId": request_id,
-                "executionId": execution_id,
-                "action": command["action"],
-                "targetCount": len(targets),
+                "scheduleId": schedule_id,
+                "revision": current["revision"],
+                "status": "ignored",
+                "reason": "older_revision",
+                "updatedAt": _now_iso(),
             }
-            self._publish_status({**base, "status": "accepted", "updatedAt": _now_iso()})
-            self._publish_status({**base, "status": "running", "updatedAt": _now_iso()})
-            state = "ON" if command["action"] == "turn_on" else "OFF"
+            self._publish_status(result, self.schedule_status_topic)
+            return result
+        if schedule["deleted"]:
+            if current is None:
+                result = {"schemaVersion": 1, "gatewayId": self.gateway_id, "scheduleId": schedule_id, "status": "ignored", "reason": "missing", "updatedAt": _now_iso()}
+            else:
+                self._schedules.pop(schedule_id, None)
+                result = {"schemaVersion": 1, "gatewayId": self.gateway_id, "scheduleId": schedule_id, "revision": schedule["revision"], "status": "deleted", "updatedAt": _now_iso()}
+            self._publish_status(result, self.schedule_status_topic)
+            return result
+        self._schedules[schedule_id] = schedule
+        result = {
+            "schemaVersion": 1,
+            "gatewayId": self.gateway_id,
+            "scheduleId": schedule_id,
+            "revision": schedule["revision"],
+            "eventCount": len(schedule["events"]),
+            "status": "updated",
+            "updatedAt": _now_iso(),
+        }
+        self._publish_status(result, self.schedule_status_topic)
+        return result
+
+    def run_schedule_tick(self, now: datetime | None = None) -> int:
+        """扫描当前分钟的定时事件并按顺序执行，返回本次触发数量。"""
+
+        current_time = now or datetime.now(timezone.utc)
+        triggered = 0
+        for schedule in list(self._schedules.values()):
+            local_now = current_time.astimezone(_resolve_time_zone(schedule["timeZone"]))
+            weekday = local_now.strftime("%a").lower()[:3]
+            minute = local_now.strftime("%H:%M")
+            for event in schedule["events"]:
+                if event["time"] != minute or weekday not in event["weekdays"]:
+                    continue
+                execution_key = f"{schedule['id']}:{schedule['revision']}:{event['id']}:{local_now:%Y-%m-%d-%H-%M}"
+                if execution_key in self._schedule_fired_keys:
+                    continue
+                self._schedule_fired_keys.add(execution_key)
+                triggered += 1
+                self._execute_schedule_event(schedule, event, execution_key)
+        return triggered
+
+    def _execute_schedule_event(self, schedule: Mapping[str, Any], event: Mapping[str, Any], execution_key: str) -> None:
+        """按最新设备快照解析定时事件并复用顺序执行器。"""
+
+        states = {command["payload"]["state"] for command in event["commands"]}
+        extra = {
+            "scheduleId": schedule["id"],
+            "revision": schedule["revision"],
+            "eventId": event["id"],
+            "executionKey": execution_key,
+        }
+        if len(states) != 1:
+            self._publish_status({"schemaVersion": 1, "gatewayId": self.gateway_id, **extra, "status": "failed", "reason": "mixed_actions", "updatedAt": _now_iso()}, self.schedule_status_topic)
+            return
+        try:
+            targets = self._resolve_schedule_targets(event["commands"])
+            action = "turn_on" if next(iter(states)) == "ON" else "turn_off"
+            self._execute_targets(
+                execution_key,
+                action,
+                targets,
+                DEFAULT_WAIT_AFTER_MS,
+                status_topic=self.schedule_status_topic,
+                extra=extra,
+                blocking=True,
+            )
+        except CommandError as error:
+            self._publish_status({"schemaVersion": 1, "gatewayId": self.gateway_id, **extra, "status": "failed", "reason": error.reason, "message": error.message, "updatedAt": _now_iso()}, self.schedule_status_topic)
+
+    def _resolve_schedule_targets(self, commands: Iterable[Mapping[str, Any]]) -> list[DeviceTarget]:
+        """根据稳定 IEEE 地址从最新 Zigbee2MQTT 快照解析设备名称。"""
+
+        devices = _as_records(self._devices, "devices")
+        by_id: dict[str, DeviceTarget] = {}
+        for record in devices:
+            device_id = _device_id(record)
+            friendly_name = _first_value(record, "friendly_name", "friendlyName", "name")
+            if device_id and isinstance(friendly_name, str) and friendly_name.strip() and not bool(record.get("disabled", False)):
+                by_id[device_id] = DeviceTarget(device_id=device_id, friendly_name=friendly_name.strip())
+        selected: list[DeviceTarget] = []
+        seen: set[str] = set()
+        for command in commands:
+            device_id = normalize_id(command.get("ieee") or command.get("deviceId"))
+            target = by_id.get(device_id)
+            if target is None:
+                raise CommandError("device_not_found", f"设备 {device_id} 不存在、已禁用或未准备好")
+            if device_id not in seen:
+                seen.add(device_id)
+                selected.append(target)
+        if not selected:
+            raise CommandError("no_valid_targets", "定时事件没有可执行设备")
+        return selected
+
+    def _execute_targets(
+        self,
+        request_id: str,
+        action: str,
+        targets: list[DeviceTarget],
+        wait_after_ms: int,
+        *,
+        status_topic: str,
+        extra: Mapping[str, Any],
+        blocking: bool,
+    ) -> dict[str, Any]:
+        """执行已解析目标并统一发布即时或定时状态。"""
+
+        if not self._execution_lock.acquire(blocking=blocking):
+            return self._reject(request_id, "already_running", "当前已有时序任务执行中", status_topic=status_topic, extra=extra)
+        try:
+            base = {"schemaVersion": 1, "gatewayId": self.gateway_id, "requestId": request_id, "executionId": _new_id("exec"), "action": action, "targetCount": len(targets), **extra}
+            self._publish_status({**base, "status": "accepted", "updatedAt": _now_iso()}, status_topic)
+            self._publish_status({**base, "status": "running", "updatedAt": _now_iso()}, status_topic)
+            state = "ON" if action == "turn_on" else "OFF"
             for index, target in enumerate(targets):
                 self._publish_device_command(target, state)
                 if index < len(targets) - 1:
-                    self.sleep_fn(command["waitAfterMs"])
+                    self.sleep_fn(wait_after_ms)
             result = {**base, "status": "completed", "updatedAt": _now_iso()}
             self._results[request_id] = copy.deepcopy(result)
-            self._publish_status(result)
+            self._publish_status(result, status_topic)
             return result
-        except CommandError as error:
-            return self._reject(request_id, error.reason, error.message)
         except Exception as error:  # pragma: no cover - 具体 MQTT 故障由运行环境触发
             LOGGER.exception("时序执行失败")
-            result = {
-                **base,
-                "status": "failed",
-                "reason": "execution_failed",
-                "message": str(error),
-                "updatedAt": _now_iso(),
-            }
+            result = {**base, "status": "failed", "reason": "execution_failed", "message": str(error), "updatedAt": _now_iso()}
             self._results[request_id] = copy.deepcopy(result)
-            self._publish_status(result)
+            self._publish_status(result, status_topic)
             return result
         finally:
             self._execution_lock.release()
@@ -365,14 +571,14 @@ class SequenceGateway:
             }
         )
 
-    def _publish_status(self, result: Mapping[str, Any]) -> None:
+    def _publish_status(self, result: Mapping[str, Any], topic: str | None = None) -> None:
         """发布保留的网关状态，便于收银台重连后恢复状态。"""
 
         payload = dict(result)
         self.publish(
             {
                 "kind": "status",
-                "topic": self.status_topic,
+                "topic": topic or self.status_topic,
                 "payload": json.dumps(payload, ensure_ascii=False),
                 "qos": 1,
                 "retain": True,
@@ -380,7 +586,15 @@ class SequenceGateway:
             }
         )
 
-    def _reject(self, request_id: str, reason: str, message: str) -> dict[str, Any]:
+    def _reject(
+        self,
+        request_id: str,
+        reason: str,
+        message: str,
+        *,
+        status_topic: str | None = None,
+        extra: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
         result = {
             "schemaVersion": 1,
             "gatewayId": self.gateway_id,
@@ -389,8 +603,9 @@ class SequenceGateway:
             "reason": reason,
             "message": message,
             "updatedAt": _now_iso(),
+            **(extra or {}),
         }
-        self._publish_status(result)
+        self._publish_status(result, status_topic)
         return result
 
 
@@ -401,16 +616,24 @@ class MqttSequenceApplication:
         self.options = options
         self.command_topic = str(options.get("command_topic", DEFAULT_COMMAND_TOPIC)).rstrip("/")
         self.status_topic = str(options.get("status_topic", DEFAULT_STATUS_TOPIC)).rstrip("/")
+        self.schedule_topic = str(options.get("schedule_topic", DEFAULT_SCHEDULE_TOPIC)).rstrip("/")
+        self.schedule_status_topic = str(options.get("schedule_status_topic", DEFAULT_SCHEDULE_STATUS_TOPIC)).rstrip("/")
+        self.schedule_time_zone = str(options.get("default_time_zone", DEFAULT_TIME_ZONE)).strip() or DEFAULT_TIME_ZONE
+        self.schedule_tick_seconds = max(1, int(options.get("schedule_tick_seconds", 1)))
         self.zigbee_base_topic = str(
             options.get("zigbee_base_topic", DEFAULT_ZIGBEE_BASE_TOPIC)
         ).rstrip("/")
         self.devices_topic = f"{self.zigbee_base_topic}/bridge/devices"
         self.groups_topic = f"{self.zigbee_base_topic}/bridge/groups"
         self.client: Any = None
+        self._connected = False
+        self._schedule_stop = threading.Event()
+        self._schedule_thread: threading.Thread | None = None
         self.gateway = SequenceGateway(
             self._publish_event,
             command_topic=self.command_topic,
             status_topic=self.status_topic,
+            schedule_status_topic=self.schedule_status_topic,
             zigbee_base_topic=self.zigbee_base_topic,
             gateway_id=str(options.get("gateway_id", "ha-sequence-gateway")),
             sleep_fn=lambda milliseconds: time.sleep(milliseconds / 1000),
@@ -432,17 +655,20 @@ class MqttSequenceApplication:
         self.client.username_pw_set(username, password)
         self.gateway.publish_lifecycle("starting", "正在等待 Zigbee2MQTT 设备和分组快照")
         self.client.connect(host, port, keepalive=60)
+        self._start_schedule_thread()
         self.client.loop_forever()
 
     def _on_connect(self, client: Any, _userdata: Any, _flags: Any, reason_code: Any, *args: Any) -> None:
         if _reason_code_value(reason_code) != 0:
             LOGGER.error("MQTT 连接失败: %s", reason_code)
             return
-        for topic in (self.command_topic, self.devices_topic, self.groups_topic):
+        self._connected = True
+        for topic in (self.command_topic, self.devices_topic, self.groups_topic, f"{self.schedule_topic}/+"):
             client.subscribe(topic, qos=1)
         self.gateway.publish_lifecycle("connected", "MQTT 已连接，等待或刷新 retained 快照")
 
     def _on_disconnect(self, _client: Any, _userdata: Any, _disconnect_flags: Any, reason_code: Any, *args: Any) -> None:
+        self._connected = False
         LOGGER.warning("MQTT 已断开: %s", reason_code)
         self.gateway.publish_lifecycle("disconnected", "MQTT 连接已断开，等待自动重连")
 
@@ -459,8 +685,33 @@ class MqttSequenceApplication:
                 return
             if message.topic == self.command_topic:
                 self.gateway.handle_command(payload, retained=bool(message.retain))
+                return
+            if message.topic == self.schedule_status_topic:
+                return
+            if message.topic.startswith(f"{self.schedule_topic}/"):
+                self.gateway.handle_schedule(payload)
         except (UnicodeDecodeError, json.JSONDecodeError, CommandError) as error:
             LOGGER.error("MQTT 消息处理失败: %s", error)
+
+    def _start_schedule_thread(self) -> None:
+        """启动单一后台调度线程，避免多个连接回调重复创建。"""
+
+        if self._schedule_thread is not None and self._schedule_thread.is_alive():
+            return
+        self._schedule_stop.clear()
+        self._schedule_thread = threading.Thread(target=self._run_schedule_loop, name="schedule-loop", daemon=True)
+        self._schedule_thread.start()
+
+    def _run_schedule_loop(self) -> None:
+        """按秒扫描定时方案，到点后复用顺序执行器。"""
+
+        while not self._schedule_stop.wait(self.schedule_tick_seconds):
+            if not self._connected:
+                continue
+            try:
+                self.gateway.run_schedule_tick()
+            except Exception:
+                LOGGER.exception("定时方案扫描失败")
 
     def _publish_idle_when_ready(self) -> None:
         if self.gateway.snapshots_ready:
@@ -497,6 +748,17 @@ def _reason_code_value(reason_code: Any) -> int:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _resolve_time_zone(name: str):
+    """解析时区；系统缺少 tzdata 时兼容上海固定 UTC+8。"""
+
+    try:
+        return ZoneInfo(name)
+    except ZoneInfoNotFoundError:
+        if name == "Asia/Shanghai":
+            return timezone(timedelta(hours=8), name="Asia/Shanghai")
+        raise
 
 
 def _new_id(prefix: str) -> str:

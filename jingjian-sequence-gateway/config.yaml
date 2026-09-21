@@ -1,5 +1,5 @@
 name: JingJian Smart Switch Sequence Gateway
-version: "1.0.0"
+version: "1.1.0"
 slug: jingjian_sequence_gateway
 description: Receives JingJian MQTT sequence commands and controls Zigbee2MQTT devices in order.
 arch:
@@ -16,6 +16,10 @@ options:
   mqtt_password: cashier
   command_topic: jingjian/smart-switch/sequences/commands
   status_topic: jingjian/smart-switch/sequences/status
+  schedule_topic: jingjian/smart-switch/schedules
+  schedule_status_topic: jingjian/smart-switch/schedules/status
+  default_time_zone: Asia/Shanghai
+  schedule_tick_seconds: 1
   zigbee_base_topic: zigbee2mqtt
   gateway_id: ha-sequence-gateway
   client_id: jingjian-sequence-gateway
@@ -26,6 +30,10 @@ schema:
   mqtt_password: password
   command_topic: str
   status_topic: str
+  schedule_topic: str
+  schedule_status_topic: str
+  default_time_zone: str
+  schedule_tick_seconds: int
   zigbee_base_topic: str
   gateway_id: str
   client_id: str

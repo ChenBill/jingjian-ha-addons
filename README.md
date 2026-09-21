@@ -38,6 +38,9 @@ jingjian-ha-addons/
 | MQTT 密码 | `cashier` |
 | 命令主题 | `jingjian/smart-switch/sequences/commands` |
 | 状态主题 | `jingjian/smart-switch/sequences/status` |
+| 定时方案主题 | `jingjian/smart-switch/schedules/<planId>` |
+| 定时状态主题 | `jingjian/smart-switch/schedules/status` |
+| 默认时区 | `Asia/Shanghai` |
 | Zigbee2MQTT 基础主题 | `zigbee2mqtt` |
 | 设备间隔 | `1500ms` |
 
@@ -47,6 +50,38 @@ jingjian-ha-addons/
 - `zigbee2mqtt/bridge/groups`
 
 应用启动后会重新订阅这两个主题和命令主题，因此 MQTT 断线重连不会丢失订阅。命令主题必须是非 retained 消息；启动或重连时收到旧 retained 命令会被明确拒绝，不会重复开关机。
+
+## 定时方案协议
+
+收银台将定时方案作为 retained 消息发布到 `jingjian/smart-switch/schedules/<planId>`。网关订阅 `schedules/+`，收到方案后按 `revision` 保存最新版本；删除方案时发布 `{"schemaVersion":1,"id":"<planId>","deleted":true}`。Broker 的 retained 消息是网关重启后的方案来源。
+
+定时方案事件使用 `time`、`weekdays` 和 `commands` 字段。`weekdays` 使用 `mon` 到 `sun`，目标必须包含稳定的 Zigbee2MQTT IEEE 地址，网关触发时会从最新的 `bridge/devices` 快照重新解析 friendly name。这样设备改名后不需要重新生成旧方案。
+
+```json
+{
+  "schemaVersion": 1,
+  "id": "jingjian_cashier_plan1",
+  "revision": 3,
+  "timeZone": "Asia/Shanghai",
+  "deleted": false,
+  "events": [
+    {
+      "id": "period-1__on",
+      "time": "09:00",
+      "weekdays": ["mon", "tue", "wed", "thu", "fri"],
+      "commands": [
+        {
+          "ieee": "0xaabbccddeeff0001",
+          "deviceId": "0xaabbccddeeff0001",
+          "payload": {"state": "ON"}
+        }
+      ]
+    }
+  ]
+}
+```
+
+网关每秒扫描当前分钟的事件。同一个方案、revision、事件和本地日期分钟只会执行一次；执行时仍然使用即时命令的全局执行锁和 1.5 秒设备间隔。定时执行状态发布到 `jingjian/smart-switch/schedules/status`，包含 `scheduleId`、`revision`、`eventId` 和 `executionKey`。
 
 ## 收银台命令协议
 

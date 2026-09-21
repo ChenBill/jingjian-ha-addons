@@ -3,6 +3,7 @@ import sys
 import threading
 import time
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
@@ -11,9 +12,11 @@ sys.path.insert(0, str(APP_DIR))
 
 from sequence_gateway import (  # noqa: E402
     DEFAULT_WAIT_AFTER_MS,
+    MqttSequenceApplication,
     SequenceGateway,
     normalize_id,
     resolve_targets,
+    validate_schedule,
 )
 
 
@@ -262,6 +265,102 @@ class SequenceGatewayTest(unittest.TestCase):
         self.assertEqual(second["status"], "rejected")
         self.assertEqual(second["reason"], "already_running")
         self.assertEqual(first_result[0]["status"], "completed")
+
+    def test_schedule_validation_normalizes_retained_plan_events(self) -> None:
+        result = validate_schedule({
+            "schemaVersion": 1,
+            "id": "plan-1",
+            "revision": 2,
+            "timeZone": "Asia/Shanghai",
+            "events": [{
+                "id": "period-1__on",
+                "time": "09:00",
+                "weekdays": ["mon"],
+                "commands": [{
+                    "deviceId": "0x0A:BB:CC:DD:EE:FF:00:01",
+                    "ieee": "0x0A:BB:CC:DD:EE:FF:00:01",
+                    "payload": {"state": "ON"},
+                }],
+            }],
+        })
+
+        self.assertEqual(result["id"], "plan-1")
+        self.assertEqual(result["revision"], 2)
+        self.assertEqual(result["events"][0]["weekdays"], ["mon"])
+        self.assertEqual(result["events"][0]["commands"][0]["ieee"], "0abbccddeeff0001")
+
+    def test_schedule_event_executes_once_and_resolves_latest_device_name(self) -> None:
+        published = []
+        gateway = SequenceGateway(
+            publish=published.append,
+            sleep_fn=lambda _milliseconds: None,
+            schedule_status_topic="jingjian/smart-switch/schedules/status",
+        )
+        gateway.set_devices(self.devices)
+        gateway.set_groups(self.groups)
+        gateway.handle_schedule({
+            "schemaVersion": 1,
+            "id": "plan-1",
+            "revision": 1,
+            "timeZone": "Asia/Shanghai",
+            "events": [{
+                "id": "period-1__on",
+                "time": "09:00",
+                "weekdays": ["mon"],
+                "commands": [{
+                    "deviceId": "0a:bb:cc:dd:ee:ff:00:01",
+                    "ieee": "0a:bb:cc:dd:ee:ff:00:01",
+                    "payload": {"state": "ON"},
+                }],
+            }],
+        })
+        renamed_devices = [dict(self.devices[0], friendly_name="new-front-lamp"), *self.devices[1:]]
+        gateway.set_devices(renamed_devices)
+
+        shanghai = timezone(timedelta(hours=8), name="Asia/Shanghai")
+        first = gateway.run_schedule_tick(datetime(2026, 9, 21, 9, 0, tzinfo=shanghai))
+        second = gateway.run_schedule_tick(datetime(2026, 9, 21, 9, 0, 30, tzinfo=shanghai))
+
+        device_messages = [item for item in published if item["kind"] == "device"]
+        self.assertEqual(first, 1)
+        self.assertEqual(second, 0)
+        self.assertEqual(device_messages[0]["topic"], "zigbee2mqtt/new-front-lamp/set")
+        self.assertEqual(device_messages[0]["payload"], '{"state": "ON"}')
+        self.assertTrue(any(item.get("status") == "completed" and item.get("scheduleId") == "plan-1" for item in published))
+
+    def test_schedule_revision_and_delete_are_idempotent(self) -> None:
+        published = []
+        gateway = SequenceGateway(publish=published.append)
+        gateway.set_devices(self.devices)
+        gateway.set_groups(self.groups)
+        schedule = {
+            "schemaVersion": 1,
+            "id": "plan-1",
+            "revision": 2,
+            "timeZone": "Asia/Shanghai",
+            "events": [],
+        }
+
+        self.assertEqual(gateway.handle_schedule(schedule)["status"], "updated")
+        self.assertEqual(gateway.handle_schedule({**schedule, "revision": 1})["status"], "ignored")
+        self.assertEqual(gateway.handle_schedule({"schemaVersion": 1, "id": "plan-1", "deleted": True})["status"], "deleted")
+        self.assertEqual(gateway.handle_schedule({"schemaVersion": 1, "id": "plan-1", "deleted": True})["status"], "ignored")
+
+    def test_mqtt_application_subscribes_to_retained_schedule_children(self) -> None:
+        app = MqttSequenceApplication({
+            "schedule_topic": "jingjian/smart-switch/schedules",
+            "schedule_status_topic": "jingjian/smart-switch/schedules/status",
+        })
+        subscriptions = []
+
+        class FakeClient:
+            def subscribe(self, topic, qos):
+                subscriptions.append((topic, qos))
+
+        app._on_connect(FakeClient(), None, None, 0)
+
+        self.assertIn(("jingjian/smart-switch/schedules/+", 1), subscriptions)
+        app._connected = False
 
 
 if __name__ == "__main__":
